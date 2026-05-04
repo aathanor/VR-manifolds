@@ -95,7 +95,7 @@ def _post_with_retry(url: str, payload: dict, retries: int = 3, timeout: int = 1
 
 
 def generate_one(prompt: str, idx: int) -> str:
-    """Generate a single completion from Ollama (strips <think>…</think> tags)."""
+    """Generate a single completion from Ollama with thinking disabled."""
     payload = {
         "model": GEN_MODEL,
         "prompt": prompt,
@@ -103,11 +103,12 @@ def generate_one(prompt: str, idx: int) -> str:
         "options": {
             "temperature": TEMPERATURE,
             "num_predict": MAX_TOKENS,
+            "think": False,          # disable qwen3 chain-of-thought so tokens go to the response
         },
     }
     data = _post_with_retry(f"{OLLAMA_URL}/api/generate", payload)
     raw = data.get("response", "").strip()
-    # Strip chain-of-thought blocks that some models emit
+    # Belt-and-suspenders: strip any residual think blocks
     import re
     raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
     return raw
@@ -406,7 +407,7 @@ def build_plotly_figure(
             mode="lines",
             line=dict(color=color, width=2),
             opacity=0.55,
-            name=f"Cluster {k}: {rep_truncated[k]}",
+            name=f"Cluster {k}: {rep_truncated[k]}" if rep_truncated[k] else f"Cluster {k}",
             legendgroup=f"cluster_{k}",
             showlegend=show_legend,
             hoverinfo="skip",
