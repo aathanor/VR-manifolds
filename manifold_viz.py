@@ -54,7 +54,7 @@ import plotly.graph_objects as go
 PROMPT = "Describe a nice meadow at sunrise. A lot of nature, nice day."
 N_COMPLETIONS   = 100
 MAX_TOKENS      = 80
-TEMPERATURE     = 1.0
+TEMPERATURE     = 1.5
 N_SNAPSHOTS     = 12   # incremental partials per completion (excludes prompt origin)
 N_CLUSTERS      = 8
 MAX_WORKERS     = 8
@@ -207,9 +207,10 @@ def build_snapshots(completions: list[str]) -> tuple[list[str], list[int], list[
         words = completion.split()
         total_words = len(words)
         if total_words == 0:
-            # Empty completion — pad with prompt
+            # Empty completion — fall back to a single-space string so the
+            # embedding call doesn't receive an empty prompt
             for s in range(N_SNAPSHOTS):
-                texts.append(PROMPT)
+                texts.append(" ")
                 comp_ids.append(c_idx)
                 snap_indices.append(s + 1)
             continue
@@ -219,8 +220,11 @@ def build_snapshots(completions: list[str]) -> tuple[list[str], list[int], list[
         snap_word_counts = np.clip(snap_word_counts, 1, total_words)
 
         for s, k in enumerate(snap_word_counts):
+            # Embed only the generated portion so each trajectory point
+            # reflects how the response text itself evolves in embedding
+            # space, free from the prompt's constant contribution.
             prefix = " ".join(words[:k])
-            texts.append(PROMPT + " " + prefix)
+            texts.append(prefix)
             comp_ids.append(c_idx)
             snap_indices.append(s + 1)
 
