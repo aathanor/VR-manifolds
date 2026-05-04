@@ -342,19 +342,33 @@ def cluster_endpoints(
 
     representatives: list[str] = []
     rep_truncated: list[str]   = []
+
+    print()
+    print("━" * 65)
+    print(" DIAGNOSTIC 2 — KMEANS CLUSTER REPRESENTATIVES")
+    print("━" * 65)
     for k in range(N_CLUSTERS):
-        mask  = np.where(labels == k)[0]
+        mask = np.where(labels == k)[0]
         if len(mask) == 0:
             representatives.append("")
             rep_truncated.append(f"Cluster {k}")
+            print(f"  cluster {k}: 0 members — NO REPRESENTATIVE")
+            print(f"  {'WARNING: cluster ' + str(k) + ' has no members':^61}")
             continue
         centroid = kmeans.cluster_centers_[k]
         dists    = np.linalg.norm(endpoint_coords[mask] - centroid, axis=1)
-        rep_idx  = mask[np.argmin(dists)]
+        rep_idx  = int(mask[np.argmin(dists)])
         rep_text = completions[rep_idx]
         representatives.append(rep_text)
         rep_truncated.append((rep_text[:57] + "…") if len(rep_text) > 60 else rep_text)
-        print(f"  cluster {k}: {rep_truncated[-1]}")
+
+        print(f"  cluster {k}: {len(mask)} members  |  representative index: {rep_idx}"
+              f"  |  length: {len(rep_text)} chars")
+        print(f"    text: {repr(rep_text)}")
+        if len(rep_text.strip()) < 10:
+            print(f"  {'!!! WARNING: cluster ' + str(k) + ' has empty/short representative !!!':^61}")
+    print("━" * 65)
+    print()
 
     return labels, representatives, rep_truncated
 
@@ -602,6 +616,25 @@ def main() -> None:
 
     # Stage 1 — completions
     completions = load_or_generate_completions()
+
+    # ── Diagnostic 1: completions content ────────────────────────────────────
+    print()
+    print("━" * 65)
+    print(" DIAGNOSTIC 1 — COMPLETIONS CACHE")
+    print("━" * 65)
+    non_empty = [c for c in completions if c and c.strip()]
+    lengths_chars = [len(c) for c in completions]
+    lengths_words = [len(c.split()) for c in completions]
+    print(f"  Total completions      : {len(completions)}")
+    print(f"  Non-empty (stripped)   : {len(non_empty)}")
+    print(f"  Avg length (chars)     : {sum(lengths_chars)/len(lengths_chars):.1f}")
+    print(f"  Avg length (words)     : {sum(lengths_words)/len(lengths_words):.1f}")
+    print()
+    print("  First 5 completions:")
+    for i, c in enumerate(completions[:5]):
+        print(f"  [{i}] ({len(c)} chars) {repr(c)}")
+    print("━" * 65)
+    print()
 
     # Stage 2 — snapshots
     texts, comp_ids, snap_indices = build_snapshots(completions)
