@@ -26,6 +26,7 @@ coherent semantic attractors.
 import hashlib
 import json
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -103,16 +104,15 @@ def generate_one(prompt: str, idx: int) -> str:
         "model": GEN_MODEL,
         "prompt": prompt,
         "stream": False,
+        "think": False,              # top-level flag for qwen3 thinking suppression
         "options": {
             "temperature": TEMPERATURE,
             "num_predict": MAX_TOKENS,
-            "think": False,          # disable qwen3 chain-of-thought so tokens go to the response
         },
     }
     data = _post_with_retry(f"{OLLAMA_URL}/api/generate", payload)
     raw = data.get("response", "").strip()
-    # Belt-and-suspenders: strip any residual think blocks
-    import re
+    # Defensive strip: remove any <think>…</think> block that still slips through
     raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
     return raw
 
@@ -128,6 +128,24 @@ def embed_one(text: str) -> np.ndarray:
 # ===========================================================================
 # 3. GENERATE COMPLETIONS (parallel, cached)
 # ===========================================================================
+
+def _validate_completions(completions: list[str]) -> None:
+    """Abort if fewer than 90 % of completions have ≥ 30 chars of real content."""
+    MIN_GOOD     = 90
+    MIN_CHARS    = 30
+    good = [c for c in completions if c and len(c.strip()) >= MIN_CHARS]
+    if len(good) < MIN_GOOD:
+        print()
+        print(f"ERROR: only {len(good)}/{len(completions)} completions have "
+              f">= {MIN_CHARS} chars of content (need >= {MIN_GOOD}).")
+        print("First 5 raw responses:")
+        for i, c in enumerate(completions[:5]):
+            print(f"  [{i}] ({len(c)} chars) {repr(c)}")
+        raise RuntimeError(
+            f"Completion quality check failed: {len(good)}/{len(completions)} usable. "
+            "Delete completions.json and rerun — check that 'think': false is working."
+        )
+
 
 def load_or_generate_completions() -> list[str]:
     if os.path.exists(COMPLETIONS_CACHE):
@@ -147,6 +165,16 @@ def load_or_generate_completions() -> list[str]:
                 i = futures[fut]
                 completions[i] = fut.result()
                 pbar.update(1)
+
+    # Validate before touching disk
+    _validate_completions(completions)
+
+    # Preview — let the user eyeball real prose before the pipeline continues
+    print()
+    print("  First 3 completions (verify these are real prose):")
+    for i in range(min(3, len(completions))):
+        print(f"  [{i}] {completions[i]}")
+        print()
 
     with open(COMPLETIONS_CACHE, "w") as f:
         json.dump(completions, f, indent=2)
