@@ -12,10 +12,12 @@ point-clouds do *not* fill embedding space uniformly: they concentrate on
 a low-dimensional sub-manifold that is "selected" by the prompt.  Each
 completion is a directed trajectory on that manifold — starting at the
 shared prompt-origin and diverging toward semantically distinct regions.
-Dimensionality reduction (MDS on cosine distances) lets us render these
-trajectories in 3-D and observe the manifold's geometry: how tightly the
-paths bundle early on, where they branch, and whether the endpoints
-cluster into coherent semantic attractors.
+Dimensionality reduction (MDS on Euclidean distances of raw embeddings)
+lets us render these trajectories in 3-D and observe the manifold's
+geometry without the spherical distortion introduced by L2 normalisation:
+how tightly the paths bundle early on, where they branch, whether
+magnitude differences carry signal, and whether the endpoints cluster into
+coherent semantic attractors.
 """
 
 # ---------------------------------------------------------------------------
@@ -35,6 +37,7 @@ import requests
 from scipy.interpolate import make_interp_spline
 from sklearn.cluster import KMeans
 from sklearn.manifold import MDS
+from sklearn.metrics.pairwise import euclidean_distances
 from tqdm import tqdm
 
 import matplotlib
@@ -63,8 +66,8 @@ COMPLETIONS_CACHE = "completions.json"
 EMBEDDINGS_CACHE  = "embeddings.npy"
 EMBED_INDEX_CACHE = "embeddings_index.json"
 
-OUT_HTML = "meadow_trajectories_3d.html"
-OUT_PNG  = "meadow_trajectories_3d_static.png"
+OUT_HTML = "meadow_trajectories_3d_unnormalized.html"
+OUT_PNG  = "meadow_trajectories_3d_unnormalized_static.png"
 
 # Cluster colours (up to 8)
 CLUSTER_COLORS = [
@@ -207,7 +210,7 @@ def _content_hash(text: str) -> str:
 
 
 def load_or_embed(texts: list[str]) -> np.ndarray:
-    """Return (len(texts), EMBED_DIM) array of L2-normalised embeddings."""
+    """Return (len(texts), EMBED_DIM) array of raw (un-normalized) embeddings."""
 
     # Load existing cache
     if os.path.exists(EMBEDDINGS_CACHE) and os.path.exists(EMBED_INDEX_CACHE):
@@ -251,29 +254,25 @@ def load_or_embed(texts: list[str]) -> np.ndarray:
     else:
         print(f"          All {len(texts)} texts found in cache — no new API calls.")
 
-    # Assemble output array in original order
+    # Assemble output array in original order — raw vectors, no normalization
     out = np.zeros((len(texts), EMBED_DIM), dtype=np.float32)
     for i, h in enumerate(hashes):
         out[i] = cache_vecs[cache_index[h]]
-
-    # L2-normalise
-    norms = np.linalg.norm(out, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1.0, norms)
-    out = out / norms
     return out
 
 
 # ===========================================================================
-# 6. PROJECT TO 3-D (MDS on cosine distance)
+# 6. PROJECT TO 3-D (MDS on Euclidean distance, raw un-normalized embeddings)
 # ===========================================================================
 
-def project_to_3d(embeddings: np.ndarray) -> np.ndarray:
-    print("[stage 4] Computing pairwise cosine distance matrix …")
-    # Embeddings are already L2-normalised, so cosine similarity = dot product
-    sim = embeddings @ embeddings.T
-    sim = np.clip(sim, -1.0, 1.0)
-    dist = 1.0 - sim  # cosine distance in [0, 2]
-    dist = (dist + dist.T) / 2  # ensure perfect symmetry
+def project_to_3d(
+    embeddings: np.ndarray,
+    comp_ids: list[int],
+    snap_indices: list[int],
+) -> np.ndarray:
+    print("[stage 4] Computing pairwise Euclidean distance matrix …")
+    dist = euclidean_distances(embeddings).astype(np.float64)
+    dist = (dist + dist.T) / 2   # ensure perfect symmetry
     np.fill_diagonal(dist, 0.0)
 
     print("[stage 4] Running MDS (this may take a minute) …")
@@ -285,9 +284,33 @@ def project_to_3d(embeddings: np.ndarray) -> np.ndarray:
         random_state=42,
         normalized_stress="auto",
     )
-    coords = mds.fit_transform(dist)
+    coords = mds.fit_transform(dist).astype(np.float32)
     print(f"          MDS stress: {mds.stress_:.6f}")
-    return coords.astype(np.float32)
+
+    # ---- Diagnostic: distance spread in the raw distance matrix -------------
+    # Locate prompt origin and all endpoint indices
+    origin_idx    = next(i for i, c in enumerate(comp_ids) if c == -1)
+    endpoint_idxs = [i for i, (c, s) in enumerate(zip(comp_ids, snap_indices))
+                     if c >= 0 and s == N_SNAPSHOTS]
+
+    d_prompt_to_ep = dist[origin_idx, endpoint_idxs]
+    ep_pairs       = dist[np.ix_(endpoint_idxs, endpoint_idxs)]
+    upper          = ep_pairs[np.triu_indices(len(endpoint_idxs), k=1)]
+
+    print()
+    print("  ── Geometry diagnostic (Euclidean distances in embedding space) ──")
+    print(f"  Prompt → endpoints   mean={d_prompt_to_ep.mean():.4f}  "
+          f"std={d_prompt_to_ep.std():.4f}  "
+          f"min={d_prompt_to_ep.min():.4f}  max={d_prompt_to_ep.max():.4f}")
+    print(f"  Endpoint ↔ endpoint  mean={upper.mean():.4f}  "
+          f"std={upper.std():.4f}  "
+          f"min={upper.min():.4f}  max={upper.max():.4f}")
+    cv = d_prompt_to_ep.std() / d_prompt_to_ep.mean() if d_prompt_to_ep.mean() > 0 else 0
+    print(f"  CoV (std/mean) of prompt→endpoint distances: {cv:.4f}  "
+          f"({'non-spherical' if cv > 0.05 else 'near-spherical'})")
+    print()
+
+    return coords
 
 
 # ===========================================================================
@@ -587,7 +610,7 @@ def main() -> None:
     embeddings = load_or_embed(texts)
 
     # Stage 4 — MDS
-    coords = project_to_3d(embeddings)
+    coords = project_to_3d(embeddings, comp_ids, snap_indices)
 
     # Stage 5 — clustering
     labels, representatives, rep_truncated = cluster_endpoints(
