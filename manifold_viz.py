@@ -339,6 +339,156 @@ def project_with_pca(
 
 
 # ===========================================================================
+# 5b. INTRINSIC DIMENSION ANALYSIS
+# ===========================================================================
+
+def _plot_scree(
+    ev:                  np.ndarray,
+    cumvar:              np.ndarray,
+    participation_ratio: float,
+    n90:                 int,
+) -> None:
+    n_show = min(30, len(ev))
+    xs     = np.arange(1, n_show + 1)
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.bar(xs, ev[:n_show] * 100, color="#457B9D", alpha=0.85,
+           label="Per-component variance")
+
+    ax2 = ax.twinx()
+    ax2.plot(xs, cumvar[:n_show] * 100, color="#E63946",
+             linewidth=1.5, marker=".", markersize=4, label="Cumulative %")
+    ax2.set_ylabel("Cumulative variance (%)", fontsize=9, color="#E63946")
+    ax2.tick_params(axis="y", labelcolor="#E63946", labelsize=8)
+    ax2.set_ylim(0, 105)
+
+    ax.axvline(participation_ratio, color="#F4A261", linewidth=2, linestyle="--",
+               label=f"Participation ratio ({participation_ratio:.1f})")
+    ax.axvline(n90, color="#2A9D8F", linewidth=2, linestyle=":",
+               label=f"90% variance threshold ({n90} PCs)")
+
+    ax.set_xlabel("Principal component", fontsize=9)
+    ax.set_ylabel("Explained variance (%)", fontsize=9)
+    ax.set_title("PCA scree plot — LLM response manifold", fontsize=11)
+    ax.tick_params(labelsize=8)
+    ax.set_xlim(0.5, n_show + 0.5)
+
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper right")
+
+    fig.tight_layout()
+    fig.savefig("pca_scree.png", dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print("[stage 3b] Saved scree plot → pca_scree.png")
+
+
+def compute_intrinsic_dimension(comp_embs: np.ndarray) -> dict:
+    """
+    PCA variance table, participation ratio, and two-NN intrinsic dimension
+    (Facco et al. 2017) computed entirely in the original 768-D space.
+
+    Returns a dict with four scalar metrics for the summary block and the
+    Plotly subtitle.
+    """
+    n_pts, n_feat = comp_embs.shape
+    n_diag = min(n_pts - 1, n_feat)
+
+    print(f"\n[stage 3b] Intrinsic dimension analysis "
+          f"(fitting PCA({n_diag}) on {n_pts}×{n_feat} matrix) …")
+    pca_diag = PCA(n_components=n_diag, random_state=42)
+    pca_diag.fit(comp_embs)
+
+    ev     = pca_diag.explained_variance_ratio_
+    var    = pca_diag.explained_variance_
+    cumvar = np.cumsum(ev)
+
+    # Participation ratio: effective number of active dimensions
+    PR = float(var.sum() ** 2 / (var ** 2).sum())
+
+    # Components needed to reach each variance threshold
+    thresholds = [0.50, 0.80, 0.90, 0.95, 0.99]
+    n_at = {t: int(np.searchsorted(cumvar, t)) + 1 for t in thresholds}
+    n_at = {t: min(v, n_diag) for t, v in n_at.items()}
+    n90  = n_at[0.90]
+
+    # ── Variance table ────────────────────────────────────────────────────
+    print()
+    print("━" * 65)
+    print(" PCA VARIANCE DIAGNOSTICS")
+    print("━" * 65)
+    print(f"  {'PC':>4}  {'Var %':>6}  {'Cumul %':>8}  Bar")
+    print(f"  {'─'*4}  {'─'*6}  {'─'*8}  {'─'*28}")
+    for i in range(min(30, n_diag)):
+        bar = "█" * int(ev[i] * 300)
+        print(f"  {i+1:4d}  {ev[i]*100:6.2f}%  {cumvar[i]*100:7.2f}%  {bar}")
+    print()
+    print("  Cumulative variance at key component counts:")
+    for c in [1, 3, 5, 10, 20, 30, 50, 100]:
+        if c <= n_diag:
+            print(f"    {c:>3} components: {cumvar[c-1]*100:.2f}%")
+    print()
+    print("  Components to reach variance threshold:")
+    for t in thresholds:
+        print(f"    {int(t*100):>3}%  →  {n_at[t]:>3} components")
+    print()
+    print(f"  Participation ratio (effective dimensions): {PR:.1f}")
+    print("━" * 65)
+
+    # ── Two-NN intrinsic dimension (Facco et al. 2017) ────────────────────
+    print(f"\n[stage 3b] Two-NN intrinsic dimension (768-D space, {n_pts} points) …")
+
+    D = euclidean_distances(comp_embs).astype(np.float64)
+    np.fill_diagonal(D, np.inf)
+    D_sorted = np.sort(D, axis=1)
+    r1 = D_sorted[:, 0]
+    r2 = D_sorted[:, 1]
+
+    valid     = r1 > 0
+    mu        = r2[valid] / r1[valid]
+    mu        = mu[mu > 1]           # must be > 1 by construction; drop noise
+    mu_sorted = np.sort(mu)
+    N         = len(mu_sorted)
+    F         = (np.arange(N) + 0.5) / N
+
+    x = np.log(mu_sorted)
+    y = -np.log(1 - F)
+
+    # Regression through origin: y = d·x  →  d = Σ(x·y) / Σ(x²)
+    id_full    = float(np.sum(x * y) / np.sum(x ** 2))
+    cutoff     = int(N * 0.9)
+    id_trimmed = float(np.sum(x[:cutoff] * y[:cutoff]) / np.sum(x[:cutoff] ** 2))
+
+    # ── Summary block ─────────────────────────────────────────────────────
+    gap = n90 - id_full
+    print()
+    print("━" * 55)
+    print(" INTRINSIC DIMENSION OF THE RESPONSE MANIFOLD")
+    print("─" * 55)
+    print(f"  Embedding space dimension:          {n_feat}")
+    print(f"  Effective PCA dimension:            ~{PR:.1f}  (participation ratio)")
+    print(f"  Components for 90% variance:        {n90}")
+    print(f"  Intrinsic dimension (two-NN):       {id_full:.2f}  (full sample)")
+    print(f"  Intrinsic dimension (90% trimmed):  {id_trimmed:.2f}  (outlier-trimmed)")
+    print()
+    print(f"  Gap (90%-PCA − intrinsic dim):      {gap:.1f}")
+    print(f"  This gap is the manifold's 'extrinsic curvature' —")
+    print(f"  the higher-D surface curves through ambient space.")
+    print("━" * 55)
+    print()
+
+    # ── Scree plot ────────────────────────────────────────────────────────
+    _plot_scree(ev, cumvar, PR, n90)
+
+    return dict(
+        intrinsic_dim         = id_full,
+        intrinsic_dim_trimmed = id_trimmed,
+        participation_ratio   = PR,
+        n_components_90pct    = n90,
+    )
+
+
+# ===========================================================================
 # 6. CLUSTER IN 768-D SPACE  (more reliable than clustering on 3-D projection)
 # ===========================================================================
 
@@ -503,6 +653,7 @@ def build_plotly_figure(
     reps_short:   list[str],
     iso:          dict,
     axis_labels:  list[str],
+    dim_stats:    dict,
 ) -> go.Figure:
     print("[stage 6] Building Plotly figure …")
 
@@ -560,15 +711,21 @@ def build_plotly_figure(
     subtitle2 = (
         f"{N_COMPLETIONS} completions, embedded by {EMBED_MODEL}, "
         f"projected to 3D (PCA), "
-        f"envelope = {int(MASS_THRESHOLD*100)}% mass isosurface  "
-        f"(KDE bw = Scott × {KDE_BANDWIDTH_FACTOR})"
+        f"envelope = {int(MASS_THRESHOLD*100)}% mass isosurface"
+    )
+    subtitle3 = (
+        f"Intrinsic dimension (two-NN): {dim_stats['intrinsic_dim']:.2f}"
+        f"  |  Effective PCA dimension (participation ratio): "
+        f"{dim_stats['participation_ratio']:.1f}"
+        f"  |  90% variance at: {dim_stats['n_components_90pct']} components"
     )
     fig.update_layout(
         title=dict(
             text=(
                 "Manifold of meaning licensed by one prompt<br>"
                 f"<sup>{PROMPT}</sup><br>"
-                f"<sup><i>{subtitle2}</i></sup>"
+                f"<sup><i>{subtitle2}</i></sup><br>"
+                f"<sup><i>{subtitle3}</i></sup>"
             ),
             font=dict(size=14),
         ),
@@ -708,12 +865,14 @@ def main() -> None:
     completions                          = load_or_generate_completions()
     prompt_emb, comp_embs                = load_or_embed_endpoints(completions)
     prompt_3d, endpoints_3d, axis_labels = project_with_pca(prompt_emb, comp_embs)
+    dim_stats                            = compute_intrinsic_dimension(comp_embs)
     labels, reps, reps_short             = cluster_in_highdim(comp_embs, completions)
     iso                                  = compute_kde_isosurface(endpoints_3d)
     print_diagnostics(endpoints_3d, iso)
 
     fig = build_plotly_figure(
-        endpoints_3d, prompt_3d, completions, labels, reps_short, iso, axis_labels
+        endpoints_3d, prompt_3d, completions, labels, reps_short, iso,
+        axis_labels, dim_stats
     )
     fig.write_html(OUT_HTML, include_plotlyjs=True)
     print(f"[stage 6] Saved interactive figure → {OUT_HTML}")
