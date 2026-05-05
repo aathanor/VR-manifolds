@@ -8,8 +8,8 @@ Rather than tracing token-by-token trajectories, this script:
 
   1. Samples 200 diverse completions from qwen3:14b (temperature 1.0).
   2. Embeds each full completion with nomic-embed-text (768-D vectors).
-  3. Projects all 201 points (prompt + 200 completions) to 3-D via MDS
-     on pairwise Euclidean distances of the raw, un-normalized vectors.
+  3. Fits PCA on the 200 endpoint vectors; projects them (and the prompt)
+     into the first 3 principal components — the axes of greatest variance.
   4. Fits a Gaussian KDE to the 200 endpoint positions in 3-D.
   5. Extracts the isosurface enclosing 70% of the probability mass via
      marching cubes — the manifold's translucent 'envelope'.
@@ -45,7 +45,7 @@ from scipy.stats import gaussian_kde
 from skimage.measure import marching_cubes, mesh_surface_area
 from skimage.measure import label as sk_label
 from sklearn.cluster import KMeans
-from sklearn.manifold import MDS
+from sklearn.decomposition import PCA
 from sklearn.metrics.pairwise import euclidean_distances
 from tqdm import tqdm
 
@@ -71,10 +71,12 @@ GEN_MODEL      = "qwen3:14b"
 EMBED_MODEL    = "nomic-embed-text"
 EMBED_DIM      = 768
 
-KDE_BANDWIDTH  = "scott"   # scipy gaussian_kde bw_method; try 0.3, 0.5, etc.
-MASS_THRESHOLD = 0.70      # isosurface encloses this fraction of KDE mass
-KDE_GRID_RES   = 60        # voxels per axis for KDE evaluation
-MARGIN_FRAC    = 0.20      # bounding-box padding on each side
+N_PCA_COMPONENTS      = 50    # PCs to fit; first 3 are used for visualization
+
+KDE_BANDWIDTH_FACTOR  = 0.4   # multiplier on Scott's rule; lower = tighter envelope
+MASS_THRESHOLD        = 0.70  # isosurface encloses this fraction of KDE mass
+KDE_GRID_RES          = 60    # voxels per axis for KDE evaluation
+MARGIN_FRAC           = 0.20  # bounding-box padding on each side
 
 # Matplotlib static PNG: use every Nth face to keep rendering tractable
 STATIC_MESH_DOWNSAMPLE = 6
@@ -83,8 +85,8 @@ COMPLETIONS_CACHE     = "completions.json"
 ENDPOINTS_CACHE       = "endpoints_only.npy"
 ENDPOINTS_INDEX_CACHE = "endpoints_only_index.json"
 
-OUT_HTML = "meadow_manifold_envelope.html"
-OUT_PNG  = "meadow_manifold_envelope_static.png"
+OUT_HTML = "meadow_manifold_envelope_pca.html"
+OUT_PNG  = "meadow_manifold_envelope_pca_static.png"
 
 # 6 visually distinct colours for clusters
 CLUSTER_COLORS = [
@@ -261,46 +263,68 @@ def load_or_embed_endpoints(
 
 
 # ===========================================================================
-# 5. PROJECT TO 3-D  (MDS on Euclidean distances, raw un-normalized vectors)
+# 5. PROJECT TO 3-D  (PCA fitted on the 200 endpoint embeddings)
 # ===========================================================================
 
-def project_to_3d(
+def project_with_pca(
     prompt_emb: np.ndarray,
     comp_embs:  np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """
+    Fit PCA on the 200 endpoint embeddings; take the first 3 PCs as the
+    visualization axes.  The prompt is projected into the same space.
+
     Returns:
-        prompt_3d    – (3,)              MDS coordinate of the prompt
-        endpoints_3d – (N_COMPLETIONS, 3) MDS coordinates of completions
+        prompt_3d    – (3,)               prompt coordinate in PC space
+        endpoints_3d – (N_COMPLETIONS, 3) completion coordinates in PC space
+        axis_labels  – ["PC-1 (X.X% var)", "PC-2 (Y.Y% var)", "PC-3 (Z.Z% var)"]
     """
-    all_embs = np.vstack([prompt_emb.reshape(1, -1), comp_embs])   # (201, 768)
-    n = all_embs.shape[0]
+    print(f"[stage 3] Fitting PCA ({N_PCA_COMPONENTS} components) on "
+          f"{comp_embs.shape[0]}×{comp_embs.shape[1]} embedding matrix …")
+    pca = PCA(n_components=N_PCA_COMPONENTS, random_state=42)
+    pca.fit(comp_embs)
 
-    print(f"[stage 3] Computing {n}×{n} Euclidean distance matrix …")
-    dist = euclidean_distances(all_embs).astype(np.float64)
-    dist = (dist + dist.T) / 2          # enforce exact symmetry
-    np.fill_diagonal(dist, 0.0)
-
-    print("[stage 3] Running MDS (this may take a minute) …")
-    mds = MDS(
-        n_components=3,
-        dissimilarity="precomputed",
-        n_init=4,
-        max_iter=400,
-        random_state=42,
-        normalized_stress="auto",
-    )
-    coords = mds.fit_transform(dist).astype(np.float32)
-    print(f"          MDS stress: {mds.stress_:.6f}")
-
-    # Geometry diagnostic on the raw 768-D distance matrix
-    d_to_prompt = dist[0, 1:]
-    ep_pairs    = dist[np.ix_(range(1, n), range(1, n))]
-    upper       = ep_pairs[np.triu_indices(n - 1, k=1)]
-    cv = d_to_prompt.std() / d_to_prompt.mean() if d_to_prompt.mean() > 0 else 0
+    ev     = pca.explained_variance_ratio_
+    cumvar = np.cumsum(ev)
 
     print()
-    print("  ── Geometry diagnostic (768-D Euclidean distances) ─────────────")
+    print("  ── PCA explained variance ──────────────────────────────────────")
+    print("  Per-component (first 10):")
+    for i in range(min(10, N_PCA_COMPONENTS)):
+        bar = "█" * int(ev[i] * 400)
+        print(f"    PC-{i+1:2d}: {ev[i]*100:5.2f}%  cumul {cumvar[i]*100:5.2f}%  {bar}")
+    print()
+    print(f"  Cumulative variance at  3 PCs : {cumvar[2]*100:.2f}%")
+    print(f"  Cumulative variance at {N_PCA_COMPONENTS:2d} PCs : {cumvar[-1]*100:.2f}%")
+    print()
+    r12 = ev[0] / ev[1]
+    r23 = ev[1] / ev[2]
+    print(f"  Variance ratios — PC-1/PC-2: {r12:.2f}×   PC-2/PC-3: {r23:.2f}×")
+    if r12 > 3:
+        print("  → Strongly anisotropic: manifold is elongated along PC-1.")
+    elif r12 > 1.5:
+        print("  → Moderately anisotropic along PC-1.")
+    else:
+        print("  → Roughly isotropic in the top 2 directions.")
+    print()
+
+    # Project endpoints to N_PCA_COMPONENTS-D, keep first 3 for visualization
+    comp_pca     = pca.transform(comp_embs)             # (200, 50)
+    endpoints_3d = comp_pca[:, :3].astype(np.float32)
+
+    # Project prompt into the same PC space (PCA handles centering)
+    prompt_pca = pca.transform(prompt_emb.reshape(1, -1))  # (1, 50)
+    prompt_3d  = prompt_pca[0, :3].astype(np.float32)
+
+    axis_labels = [f"PC-{i+1} ({ev[i]*100:.1f}% var)" for i in range(3)]
+
+    # Geometry diagnostic in the reduced (50-D) PC space
+    d_to_prompt = np.linalg.norm(comp_pca - prompt_pca, axis=1)
+    ep_dists    = euclidean_distances(comp_pca)
+    upper       = ep_dists[np.triu_indices(len(comp_pca), k=1)]
+    cv = d_to_prompt.std() / d_to_prompt.mean() if d_to_prompt.mean() > 0 else 0
+
+    print(f"  ── Geometry diagnostic ({N_PCA_COMPONENTS}-D PC distances) ─────────────────")
     print(f"  Prompt → endpoints    mean={d_to_prompt.mean():.4f}  "
           f"std={d_to_prompt.std():.4f}  "
           f"min={d_to_prompt.min():.4f}  max={d_to_prompt.max():.4f}")
@@ -311,11 +335,11 @@ def project_to_3d(
           f"({'non-spherical' if cv > 0.05 else 'near-spherical'})")
     print()
 
-    return coords[0], coords[1:]        # prompt_3d, endpoints_3d
+    return prompt_3d, endpoints_3d, axis_labels
 
 
 # ===========================================================================
-# 6. CLUSTER IN 768-D SPACE  (more reliable than clustering after MDS)
+# 6. CLUSTER IN 768-D SPACE  (more reliable than clustering on 3-D projection)
 # ===========================================================================
 
 def cluster_in_highdim(
@@ -382,8 +406,12 @@ def compute_kde_isosurface(endpoints_3d: np.ndarray) -> dict:
         spacing      – (dx, dy, dz) voxel dimensions
         lo           – (3,) world-space grid origin
     """
-    print(f"[stage 5] Fitting Gaussian KDE (bw_method={KDE_BANDWIDTH!r}) …")
-    kde = gaussian_kde(endpoints_3d.T, bw_method=KDE_BANDWIDTH)
+    n, d   = endpoints_3d.shape
+    scott  = n ** (-1.0 / (d + 4))             # Scott's rule factor
+    bw     = scott * KDE_BANDWIDTH_FACTOR      # scaled factor
+    print(f"[stage 5] Fitting Gaussian KDE  "
+          f"(Scott={scott:.4f}, factor={KDE_BANDWIDTH_FACTOR}, effective bw={bw:.4f}) …")
+    kde = gaussian_kde(endpoints_3d.T, bw_method=bw)
 
     lo = endpoints_3d.min(axis=0)
     hi = endpoints_3d.max(axis=0)
@@ -436,7 +464,7 @@ def print_diagnostics(endpoints_3d: np.ndarray, iso: dict) -> None:
 
     lo_pts = endpoints_3d.min(axis=0)
     hi_pts = endpoints_3d.max(axis=0)
-    print("  Endpoint cloud bounding box (3-D MDS coordinates):")
+    print("  Endpoint cloud bounding box (3-D PCA coordinates):")
     for axis, label in enumerate("xyz"):
         span = hi_pts[axis] - lo_pts[axis]
         print(f"    {label}: [{lo_pts[axis]:.4f}, {hi_pts[axis]:.4f}]"
@@ -450,8 +478,8 @@ def print_diagnostics(endpoints_3d: np.ndarray, iso: dict) -> None:
     n_comp      = int(sk_label(binary).max())
 
     print(f"\n  Isosurface (encloses {MASS_THRESHOLD*100:.0f}% of KDE mass):")
-    print(f"    Volume         : {volume:.6f}  (MDS units)³")
-    print(f"    Surface area   : {area:.6f}  (MDS units)²")
+    print(f"    Volume         : {volume:.6f}  (PC units)³")
+    print(f"    Surface area   : {area:.6f}  (PC units)²")
     print(f"    Connected lobes: {n_comp}")
     if n_comp == 1:
         print("    → Single connected blob — one coherent semantic neighbourhood.")
@@ -474,6 +502,7 @@ def build_plotly_figure(
     labels:       np.ndarray,
     reps_short:   list[str],
     iso:          dict,
+    axis_labels:  list[str],
 ) -> go.Figure:
     print("[stage 6] Building Plotly figure …")
 
@@ -530,8 +559,9 @@ def build_plotly_figure(
 
     subtitle2 = (
         f"{N_COMPLETIONS} completions, embedded by {EMBED_MODEL}, "
-        f"projected to 3D (MDS), "
-        f"envelope = {int(MASS_THRESHOLD*100)}% mass isosurface"
+        f"projected to 3D (PCA), "
+        f"envelope = {int(MASS_THRESHOLD*100)}% mass isosurface  "
+        f"(KDE bw = Scott × {KDE_BANDWIDTH_FACTOR})"
     )
     fig.update_layout(
         title=dict(
@@ -543,9 +573,9 @@ def build_plotly_figure(
             font=dict(size=14),
         ),
         scene=dict(
-            xaxis_title="MDS-1",
-            yaxis_title="MDS-2",
-            zaxis_title="MDS-3",
+            xaxis_title=axis_labels[0],
+            yaxis_title=axis_labels[1],
+            zaxis_title=axis_labels[2],
         ),
         legend=dict(
             title="Clusters (representative completion)",
@@ -567,6 +597,7 @@ def build_static_figure(
     labels:       np.ndarray,
     reps_short:   list[str],
     iso:          dict,
+    axis_labels:  list[str],
 ) -> None:
     print("[stage 7] Building static 4-view PNG …")
 
@@ -598,9 +629,9 @@ def build_static_figure(
     for ax_i, (elev, azim, view_name) in enumerate(view_angles):
         ax = fig.add_subplot(2, 2, ax_i + 1, projection="3d")
         ax.set_title(view_name, fontsize=9, pad=4)
-        ax.set_xlabel("MDS-1", fontsize=7, labelpad=2)
-        ax.set_ylabel("MDS-2", fontsize=7, labelpad=2)
-        ax.set_zlabel("MDS-3", fontsize=7, labelpad=2)
+        ax.set_xlabel(axis_labels[0], fontsize=6, labelpad=2)
+        ax.set_ylabel(axis_labels[1], fontsize=6, labelpad=2)
+        ax.set_zlabel(axis_labels[2], fontsize=6, labelpad=2)
         ax.tick_params(labelsize=6)
         ax.view_init(elev=elev, azim=azim)
         ax.set_xlim(*xlim)
@@ -663,29 +694,31 @@ def build_static_figure(
 
 def main() -> None:
     print("=" * 65)
-    print(" LLM RESPONSE MANIFOLD VISUALISER  (envelope edition)")
+    print(" LLM RESPONSE MANIFOLD VISUALISER  (PCA + envelope edition)")
     print("=" * 65)
     print(f" Prompt          : {PROMPT}")
     print(f" Model           : {GEN_MODEL}  |  Embed: {EMBED_MODEL}")
     print(f" Completions     : {N_COMPLETIONS}  |  Clusters: {N_CLUSTERS}")
-    print(f" KDE bandwidth   : {KDE_BANDWIDTH}  |  Mass threshold: {MASS_THRESHOLD}")
+    print(f" PCA components  : {N_PCA_COMPONENTS}  |  Visualized: first 3")
+    print(f" KDE bw factor   : Scott × {KDE_BANDWIDTH_FACTOR}  "
+          f"|  Mass threshold: {MASS_THRESHOLD}")
     print(f" Grid resolution : {KDE_GRID_RES}³")
     print("=" * 65)
 
-    completions               = load_or_generate_completions()
-    prompt_emb, comp_embs     = load_or_embed_endpoints(completions)
-    prompt_3d,  endpoints_3d  = project_to_3d(prompt_emb, comp_embs)
-    labels, reps, reps_short  = cluster_in_highdim(comp_embs, completions)
-    iso                       = compute_kde_isosurface(endpoints_3d)
+    completions                          = load_or_generate_completions()
+    prompt_emb, comp_embs                = load_or_embed_endpoints(completions)
+    prompt_3d, endpoints_3d, axis_labels = project_with_pca(prompt_emb, comp_embs)
+    labels, reps, reps_short             = cluster_in_highdim(comp_embs, completions)
+    iso                                  = compute_kde_isosurface(endpoints_3d)
     print_diagnostics(endpoints_3d, iso)
 
     fig = build_plotly_figure(
-        endpoints_3d, prompt_3d, completions, labels, reps_short, iso
+        endpoints_3d, prompt_3d, completions, labels, reps_short, iso, axis_labels
     )
     fig.write_html(OUT_HTML, include_plotlyjs=True)
     print(f"[stage 6] Saved interactive figure → {OUT_HTML}")
 
-    build_static_figure(endpoints_3d, prompt_3d, labels, reps_short, iso)
+    build_static_figure(endpoints_3d, prompt_3d, labels, reps_short, iso, axis_labels)
     print(f"[stage 7] Saved static figure       → {OUT_PNG}")
 
     print()
