@@ -62,8 +62,8 @@ import plotly.graph_objects as go
 # ===========================================================================
 PROMPT         = "Describe a nice meadow at sunrise. A lot of nature, nice day."
 N_COMPLETIONS  = 200
-MAX_TOKENS     = 80
-TEMPERATURE    = 1.0
+MAX_TOKENS     = 150
+TEMPERATURE    = 1.5
 N_CLUSTERS     = 6
 MAX_WORKERS    = 8
 OLLAMA_URL     = "http://localhost:11434"
