@@ -1,23 +1,29 @@
 """
 manifold_viz.py
 ===============
-Visualises LLM response trajectories as paths on a learned manifold.
+Renders the 'manifold of meaning' that a prompt licenses in an LLM's
+response space.
+
+Rather than tracing token-by-token trajectories, this script:
+
+  1. Samples 200 diverse completions from qwen3:14b (temperature 1.0).
+  2. Embeds each full completion with nomic-embed-text (768-D vectors).
+  3. Projects all 201 points (prompt + 200 completions) to 3-D via MDS
+     on pairwise Euclidean distances of the raw, un-normalized vectors.
+  4. Fits a Gaussian KDE to the 200 endpoint positions in 3-D.
+  5. Extracts the isosurface enclosing 70% of the probability mass via
+     marching cubes — the manifold's translucent 'envelope'.
+  6. Renders an interactive Plotly figure: envelope mesh + cluster-coloured
+     scatter points + prompt origin marker.
 
 Philosophical claim
 -------------------
-A language model defines an implicit probability distribution over
-completions conditioned on a prompt.  When you sample many completions
-from the same prompt and embed each one token-by-token, the resulting
-point-clouds do *not* fill embedding space uniformly: they concentrate on
-a low-dimensional sub-manifold that is "selected" by the prompt.  Each
-completion is a directed trajectory on that manifold — starting at the
-shared prompt-origin and diverging toward semantically distinct regions.
-Dimensionality reduction (MDS on Euclidean distances of raw embeddings)
-lets us render these trajectories in 3-D and observe the manifold's
-geometry without the spherical distortion introduced by L2 normalisation:
-how tightly the paths bundle early on, where they branch, whether
-magnitude differences carry signal, and whether the endpoints cluster into
-coherent semantic attractors.
+Every prompt selects a bounded region of the LLM's output distribution.
+Embedded in a metric space, that region traces a structured shape — not a
+random cloud but a 'manifold of meaning' with measurable geometry: volume,
+surface area, and connectivity.  The number of disconnected lobes tells us
+whether the prompt licenses one coherent semantic neighbourhood or several
+distinct ones.
 """
 
 # ---------------------------------------------------------------------------
@@ -35,7 +41,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ---------------------------------------------------------------------------
 import numpy as np
 import requests
-from scipy.interpolate import make_interp_spline
+from scipy.stats import gaussian_kde
+from skimage.measure import marching_cubes, mesh_surface_area
+from skimage.measure import label as sk_label
 from sklearn.cluster import KMeans
 from sklearn.manifold import MDS
 from sklearn.metrics.pairwise import euclidean_distances
@@ -44,43 +52,52 @@ from tqdm import tqdm
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers 3-D projection)
+from mpl_toolkits.mplot3d import Axes3D          # noqa: F401 — registers projection
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 import plotly.graph_objects as go
 
 # ===========================================================================
 # 1. CONFIGURATION
 # ===========================================================================
-PROMPT = "Describe a nice meadow at sunrise. A lot of nature, nice day."
-N_COMPLETIONS   = 100
-MAX_TOKENS      = 80
-TEMPERATURE     = 1.5
-N_SNAPSHOTS     = 12   # incremental partials per completion (excludes prompt origin)
-N_CLUSTERS      = 8
-MAX_WORKERS     = 8
-OLLAMA_URL      = "http://localhost:11434"
-GEN_MODEL       = "qwen3:14b"
-EMBED_MODEL     = "nomic-embed-text"
-EMBED_DIM       = 768
+PROMPT         = "Describe a nice meadow at sunrise. A lot of nature, nice day."
+N_COMPLETIONS  = 200
+MAX_TOKENS     = 80
+TEMPERATURE    = 1.0
+N_CLUSTERS     = 6
+MAX_WORKERS    = 8
+OLLAMA_URL     = "http://localhost:11434"
+GEN_MODEL      = "qwen3:14b"
+EMBED_MODEL    = "nomic-embed-text"
+EMBED_DIM      = 768
 
-COMPLETIONS_CACHE = "completions.json"
-EMBEDDINGS_CACHE  = "embeddings.npy"
-EMBED_INDEX_CACHE = "embeddings_index.json"
+KDE_BANDWIDTH  = "scott"   # scipy gaussian_kde bw_method; try 0.3, 0.5, etc.
+MASS_THRESHOLD = 0.70      # isosurface encloses this fraction of KDE mass
+KDE_GRID_RES   = 60        # voxels per axis for KDE evaluation
+MARGIN_FRAC    = 0.20      # bounding-box padding on each side
 
-OUT_HTML = "meadow_trajectories_3d_unnormalized.html"
-OUT_PNG  = "meadow_trajectories_3d_unnormalized_static.png"
+# Matplotlib static PNG: use every Nth face to keep rendering tractable
+STATIC_MESH_DOWNSAMPLE = 6
 
-# Cluster colours (up to 8)
+COMPLETIONS_CACHE     = "completions.json"
+ENDPOINTS_CACHE       = "endpoints_only.npy"
+ENDPOINTS_INDEX_CACHE = "endpoints_only_index.json"
+
+OUT_HTML = "meadow_manifold_envelope.html"
+OUT_PNG  = "meadow_manifold_envelope_static.png"
+
+# 6 visually distinct colours for clusters
 CLUSTER_COLORS = [
-    "#E63946", "#2A9D8F", "#E9C46A", "#457B9D",
-    "#F4A261", "#6D6875", "#52B788", "#D62828",
+    "#E63946", "#2A9D8F", "#E9C46A",
+    "#457B9D", "#F4A261", "#6D6875",
 ]
 
 # ===========================================================================
 # 2. OLLAMA HELPERS
 # ===========================================================================
 
-def _post_with_retry(url: str, payload: dict, retries: int = 3, timeout: int = 120) -> dict:
+def _post_with_retry(url: str, payload: dict, retries: int = 3,
+                     timeout: int = 120) -> dict:
     """POST to Ollama with exponential-backoff retry on connection errors."""
     delay = 2.0
     for attempt in range(retries):
@@ -90,7 +107,9 @@ def _post_with_retry(url: str, payload: dict, retries: int = 3, timeout: int = 1
             return resp.json()
         except (requests.ConnectionError, requests.Timeout) as exc:
             if attempt == retries - 1:
-                raise RuntimeError(f"Ollama request failed after {retries} attempts: {exc}") from exc
+                raise RuntimeError(
+                    f"Ollama request failed after {retries} attempts: {exc}"
+                ) from exc
             print(f"\n  [retry {attempt+1}/{retries}] {exc} — waiting {delay:.0f}s")
             time.sleep(delay)
             delay *= 2
@@ -99,51 +118,49 @@ def _post_with_retry(url: str, payload: dict, retries: int = 3, timeout: int = 1
 
 
 def generate_one(prompt: str, idx: int) -> str:
-    """Generate a single completion from Ollama with thinking disabled."""
+    """Generate one completion from Ollama with qwen3 thinking disabled."""
     payload = {
-        "model": GEN_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "think": False,              # top-level flag for qwen3 thinking suppression
+        "model":   GEN_MODEL,
+        "prompt":  prompt,
+        "stream":  False,
+        "think":   False,          # top-level field; suppresses qwen3 CoT
         "options": {
             "temperature": TEMPERATURE,
             "num_predict": MAX_TOKENS,
         },
     }
     data = _post_with_retry(f"{OLLAMA_URL}/api/generate", payload)
-    raw = data.get("response", "").strip()
-    # Defensive strip: remove any <think>…</think> block that still slips through
-    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    raw  = data.get("response", "").strip()
+    # Defensive: strip any <think>…</think> block that still slips through
+    raw  = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
     return raw
 
 
 def embed_one(text: str) -> np.ndarray:
-    """Return a 768-D embedding vector for *text*."""
+    """Return a raw 768-D embedding vector for *text*."""
     payload = {"model": EMBED_MODEL, "prompt": text}
-    data = _post_with_retry(f"{OLLAMA_URL}/api/embeddings", payload)
-    vec = np.array(data["embedding"], dtype=np.float32)
-    return vec
+    data    = _post_with_retry(f"{OLLAMA_URL}/api/embeddings", payload)
+    return np.array(data["embedding"], dtype=np.float32)
 
 
 # ===========================================================================
-# 3. GENERATE COMPLETIONS (parallel, cached)
+# 3. GENERATE COMPLETIONS  (parallel, cached)
 # ===========================================================================
 
 def _validate_completions(completions: list[str]) -> None:
-    """Abort if fewer than 90 % of completions have ≥ 30 chars of real content."""
-    MIN_GOOD     = 90
-    MIN_CHARS    = 30
-    good = [c for c in completions if c and len(c.strip()) >= MIN_CHARS]
-    if len(good) < MIN_GOOD:
-        print()
-        print(f"ERROR: only {len(good)}/{len(completions)} completions have "
-              f">= {MIN_CHARS} chars of content (need >= {MIN_GOOD}).")
+    """Abort before writing cache if too many completions are empty/short."""
+    min_good  = int(N_COMPLETIONS * 0.90)
+    min_chars = 30
+    good = [c for c in completions if c and len(c.strip()) >= min_chars]
+    if len(good) < min_good:
+        print(f"\nERROR: only {len(good)}/{len(completions)} completions have "
+              f">= {min_chars} chars (need >= {min_good}).")
         print("First 5 raw responses:")
         for i, c in enumerate(completions[:5]):
             print(f"  [{i}] ({len(c)} chars) {repr(c)}")
         raise RuntimeError(
             f"Completion quality check failed: {len(good)}/{len(completions)} usable. "
-            "Delete completions.json and rerun — check that 'think': false is working."
+            "Delete completions.json and rerun — verify 'think': false is working."
         )
 
 
@@ -159,22 +176,18 @@ def load_or_generate_completions() -> list[str]:
     completions: list[str] = [None] * N_COMPLETIONS
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(generate_one, PROMPT, i): i for i in range(N_COMPLETIONS)}
+        futures = {pool.submit(generate_one, PROMPT, i): i
+                   for i in range(N_COMPLETIONS)}
         with tqdm(total=N_COMPLETIONS, desc="  generating") as pbar:
             for fut in as_completed(futures):
-                i = futures[fut]
-                completions[i] = fut.result()
+                completions[futures[fut]] = fut.result()
                 pbar.update(1)
 
-    # Validate before touching disk
     _validate_completions(completions)
 
-    # Preview — let the user eyeball real prose before the pipeline continues
-    print()
-    print("  First 3 completions (verify these are real prose):")
+    print("\n  First 3 completions (verify real prose before continuing):")
     for i in range(min(3, len(completions))):
-        print(f"  [{i}] {completions[i]}")
-        print()
+        print(f"  [{i}] {completions[i]}\n")
 
     with open(COMPLETIONS_CACHE, "w") as f:
         json.dump(completions, f, indent=2)
@@ -183,131 +196,92 @@ def load_or_generate_completions() -> list[str]:
 
 
 # ===========================================================================
-# 4. BUILD INCREMENTAL SNAPSHOTS
-# ===========================================================================
-
-def build_snapshots(completions: list[str]) -> tuple[list[str], list[int], list[int]]:
-    """
-    Returns:
-        texts        – flat list of all snapshot strings to embed
-        comp_ids     – which completion each snapshot belongs to (-1 = prompt origin)
-        snap_indices – snapshot index within its completion (0 = prompt origin)
-    """
-    print("[stage 2] Building incremental snapshots …")
-    texts: list[str]   = []
-    comp_ids: list[int]  = []
-    snap_indices: list[int] = []
-
-    # Prompt origin (shared across all trajectories, embedded once)
-    texts.append(PROMPT)
-    comp_ids.append(-1)
-    snap_indices.append(0)
-
-    for c_idx, completion in enumerate(completions):
-        words = completion.split()
-        total_words = len(words)
-        if total_words == 0:
-            # Empty completion — fall back to a single-space string so the
-            # embedding call doesn't receive an empty prompt
-            for s in range(N_SNAPSHOTS):
-                texts.append(" ")
-                comp_ids.append(c_idx)
-                snap_indices.append(s + 1)
-            continue
-
-        # Evenly-spaced word counts: 1 word … all words
-        snap_word_counts = np.linspace(1, total_words, N_SNAPSHOTS, dtype=int)
-        snap_word_counts = np.clip(snap_word_counts, 1, total_words)
-
-        for s, k in enumerate(snap_word_counts):
-            # Embed only the generated portion so each trajectory point
-            # reflects how the response text itself evolves in embedding
-            # space, free from the prompt's constant contribution.
-            prefix = " ".join(words[:k])
-            texts.append(prefix)
-            comp_ids.append(c_idx)
-            snap_indices.append(s + 1)
-
-    print(f"          {len(texts)} total snapshot texts "
-          f"(1 origin + {N_COMPLETIONS}×{N_SNAPSHOTS} partials).")
-    return texts, comp_ids, snap_indices
-
-
-# ===========================================================================
-# 5. EMBED EVERYTHING (parallel, cached by content hash)
+# 4. EMBED ENDPOINTS ONLY  (prompt + full completions, parallel, cached)
 # ===========================================================================
 
 def _content_hash(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()
 
 
-def load_or_embed(texts: list[str]) -> np.ndarray:
-    """Return (len(texts), EMBED_DIM) array of raw (un-normalized) embeddings."""
+def load_or_embed_endpoints(
+    completions: list[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Embed the prompt (index 0) and all full completions (indices 1..N).
+    No partial snapshots — one vector per response.
 
-    # Load existing cache
-    if os.path.exists(EMBEDDINGS_CACHE) and os.path.exists(EMBED_INDEX_CACHE):
-        print(f"[stage 3] Loading embedding cache from {EMBEDDINGS_CACHE} …")
-        cache_vecs  = np.load(EMBEDDINGS_CACHE)
-        with open(EMBED_INDEX_CACHE) as f:
-            cache_index: dict[str, int] = json.load(f)  # hash -> row in cache_vecs
+    Returns:
+        prompt_emb  – (768,)            raw embedding of the prompt
+        comp_embs   – (N_COMPLETIONS, 768)  raw embeddings of completions
+    """
+    texts = [PROMPT] + completions          # 201 strings total
+
+    if os.path.exists(ENDPOINTS_CACHE) and os.path.exists(ENDPOINTS_INDEX_CACHE):
+        print(f"[stage 2] Loading embedding cache from {ENDPOINTS_CACHE} …")
+        cache_vecs = np.load(ENDPOINTS_CACHE)
+        with open(ENDPOINTS_INDEX_CACHE) as f:
+            cache_index: dict[str, int] = json.load(f)
     else:
         cache_vecs  = np.zeros((0, EMBED_DIM), dtype=np.float32)
         cache_index = {}
 
-    hashes = [_content_hash(t) for t in texts]
-    missing_indices = [i for i, h in enumerate(hashes) if h not in cache_index]
+    hashes  = [_content_hash(t) for t in texts]
+    missing = [i for i, h in enumerate(hashes) if h not in cache_index]
 
-    if missing_indices:
-        print(f"          Embedding {len(missing_indices)} new texts with {EMBED_MODEL} …")
+    if missing:
+        print(f"          Embedding {len(missing)} new texts with {EMBED_MODEL} …")
         new_vecs: dict[int, np.ndarray] = {}
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            futures = {pool.submit(embed_one, texts[i]): i for i in missing_indices}
-            with tqdm(total=len(missing_indices), desc="  embedding") as pbar:
+            futures = {pool.submit(embed_one, texts[i]): i for i in missing}
+            with tqdm(total=len(missing), desc="  embedding") as pbar:
                 for fut in as_completed(futures):
-                    i = futures[fut]
-                    new_vecs[i] = fut.result()
+                    new_vecs[futures[fut]] = fut.result()
                     pbar.update(1)
 
-        # Append new rows to cache
         next_row = len(cache_index)
-        rows_to_stack = [cache_vecs] if cache_vecs.shape[0] > 0 else []
-        for i in missing_indices:
-            h = hashes[i]
-            cache_index[h] = next_row
-            rows_to_stack.append(new_vecs[i].reshape(1, -1))
+        rows = [cache_vecs] if cache_vecs.shape[0] > 0 else []
+        for i in missing:
+            cache_index[hashes[i]] = next_row
+            rows.append(new_vecs[i].reshape(1, -1))
             next_row += 1
-        cache_vecs = np.vstack(rows_to_stack)
-
-        np.save(EMBEDDINGS_CACHE, cache_vecs)
-        with open(EMBED_INDEX_CACHE, "w") as f:
+        cache_vecs = np.vstack(rows)
+        np.save(ENDPOINTS_CACHE, cache_vecs)
+        with open(ENDPOINTS_INDEX_CACHE, "w") as f:
             json.dump(cache_index, f)
-        print(f"          Cache updated ({cache_vecs.shape[0]} total rows).")
+        print(f"          Cache updated ({cache_vecs.shape[0]} rows).")
     else:
-        print(f"          All {len(texts)} texts found in cache — no new API calls.")
+        print(f"          All {len(texts)} texts found in cache — no API calls needed.")
 
-    # Assemble output array in original order — raw vectors, no normalization
     out = np.zeros((len(texts), EMBED_DIM), dtype=np.float32)
     for i, h in enumerate(hashes):
         out[i] = cache_vecs[cache_index[h]]
-    return out
+
+    return out[0], out[1:]          # prompt_emb, comp_embs
 
 
 # ===========================================================================
-# 6. PROJECT TO 3-D (MDS on Euclidean distance, raw un-normalized embeddings)
+# 5. PROJECT TO 3-D  (MDS on Euclidean distances, raw un-normalized vectors)
 # ===========================================================================
 
 def project_to_3d(
-    embeddings: np.ndarray,
-    comp_ids: list[int],
-    snap_indices: list[int],
-) -> np.ndarray:
-    print("[stage 4] Computing pairwise Euclidean distance matrix …")
-    dist = euclidean_distances(embeddings).astype(np.float64)
-    dist = (dist + dist.T) / 2   # ensure perfect symmetry
+    prompt_emb: np.ndarray,
+    comp_embs:  np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+        prompt_3d    – (3,)              MDS coordinate of the prompt
+        endpoints_3d – (N_COMPLETIONS, 3) MDS coordinates of completions
+    """
+    all_embs = np.vstack([prompt_emb.reshape(1, -1), comp_embs])   # (201, 768)
+    n = all_embs.shape[0]
+
+    print(f"[stage 3] Computing {n}×{n} Euclidean distance matrix …")
+    dist = euclidean_distances(all_embs).astype(np.float64)
+    dist = (dist + dist.T) / 2          # enforce exact symmetry
     np.fill_diagonal(dist, 0.0)
 
-    print("[stage 4] Running MDS (this may take a minute) …")
+    print("[stage 3] Running MDS (this may take a minute) …")
     mds = MDS(
         n_components=3,
         dissimilarity="precomputed",
@@ -319,204 +293,255 @@ def project_to_3d(
     coords = mds.fit_transform(dist).astype(np.float32)
     print(f"          MDS stress: {mds.stress_:.6f}")
 
-    # ---- Diagnostic: distance spread in the raw distance matrix -------------
-    # Locate prompt origin and all endpoint indices
-    origin_idx    = next(i for i, c in enumerate(comp_ids) if c == -1)
-    endpoint_idxs = [i for i, (c, s) in enumerate(zip(comp_ids, snap_indices))
-                     if c >= 0 and s == N_SNAPSHOTS]
-
-    d_prompt_to_ep = dist[origin_idx, endpoint_idxs]
-    ep_pairs       = dist[np.ix_(endpoint_idxs, endpoint_idxs)]
-    upper          = ep_pairs[np.triu_indices(len(endpoint_idxs), k=1)]
+    # Geometry diagnostic on the raw 768-D distance matrix
+    d_to_prompt = dist[0, 1:]
+    ep_pairs    = dist[np.ix_(range(1, n), range(1, n))]
+    upper       = ep_pairs[np.triu_indices(n - 1, k=1)]
+    cv = d_to_prompt.std() / d_to_prompt.mean() if d_to_prompt.mean() > 0 else 0
 
     print()
-    print("  ── Geometry diagnostic (Euclidean distances in embedding space) ──")
-    print(f"  Prompt → endpoints   mean={d_prompt_to_ep.mean():.4f}  "
-          f"std={d_prompt_to_ep.std():.4f}  "
-          f"min={d_prompt_to_ep.min():.4f}  max={d_prompt_to_ep.max():.4f}")
-    print(f"  Endpoint ↔ endpoint  mean={upper.mean():.4f}  "
+    print("  ── Geometry diagnostic (768-D Euclidean distances) ─────────────")
+    print(f"  Prompt → endpoints    mean={d_to_prompt.mean():.4f}  "
+          f"std={d_to_prompt.std():.4f}  "
+          f"min={d_to_prompt.min():.4f}  max={d_to_prompt.max():.4f}")
+    print(f"  Endpoint ↔ endpoint   mean={upper.mean():.4f}  "
           f"std={upper.std():.4f}  "
           f"min={upper.min():.4f}  max={upper.max():.4f}")
-    cv = d_prompt_to_ep.std() / d_prompt_to_ep.mean() if d_prompt_to_ep.mean() > 0 else 0
-    print(f"  CoV (std/mean) of prompt→endpoint distances: {cv:.4f}  "
+    print(f"  CoV of prompt→endpoint distances: {cv:.4f}  "
           f"({'non-spherical' if cv > 0.05 else 'near-spherical'})")
     print()
 
-    return coords
+    return coords[0], coords[1:]        # prompt_3d, endpoints_3d
 
 
 # ===========================================================================
-# 7. CLUSTER ENDPOINTS + FIND REPRESENTATIVES
+# 6. CLUSTER IN 768-D SPACE  (more reliable than clustering after MDS)
 # ===========================================================================
 
-def cluster_endpoints(
-    coords: np.ndarray,
-    comp_ids: list[int],
-    snap_indices: list[int],
+def cluster_in_highdim(
+    comp_embs:   np.ndarray,
     completions: list[str],
 ) -> tuple[np.ndarray, list[str], list[str]]:
     """
+    KMeans on raw 768-D embeddings.
+
     Returns:
-        labels           – cluster label per completion (len = N_COMPLETIONS)
-        representatives  – one representative completion string per cluster
-        rep_truncated    – 60-char truncations for legend
+        labels      – (N_COMPLETIONS,) int32 cluster indices
+        reps        – full representative completion text per cluster
+        reps_short  – 60-char truncations for the legend
     """
-    print("[stage 5] Clustering endpoints with KMeans …")
+    print(f"[stage 4] KMeans (k={N_CLUSTERS}) in 768-D embedding space …")
+    km     = KMeans(n_clusters=N_CLUSTERS, random_state=42, n_init=10)
+    labels = km.fit_predict(comp_embs).astype(np.int32)
 
-    # Collect endpoint coords (last snapshot of each completion)
-    endpoint_coords = np.zeros((N_COMPLETIONS, 3), dtype=np.float32)
-    for flat_i, (c_idx, s_idx) in enumerate(zip(comp_ids, snap_indices)):
-        if c_idx >= 0 and s_idx == N_SNAPSHOTS:
-            endpoint_coords[c_idx] = coords[flat_i]
-
-    kmeans = KMeans(n_clusters=N_CLUSTERS, random_state=42, n_init=10)
-    labels = kmeans.fit_predict(endpoint_coords)
-
-    representatives: list[str] = []
-    rep_truncated: list[str]   = []
+    reps:       list[str] = []
+    reps_short: list[str] = []
 
     print()
     print("━" * 65)
-    print(" DIAGNOSTIC 2 — KMEANS CLUSTER REPRESENTATIVES")
+    print(" CLUSTER REPRESENTATIVES")
     print("━" * 65)
     for k in range(N_CLUSTERS):
         mask = np.where(labels == k)[0]
         if len(mask) == 0:
-            representatives.append("")
-            rep_truncated.append(f"Cluster {k}")
-            print(f"  cluster {k}: 0 members — NO REPRESENTATIVE")
-            print(f"  {'WARNING: cluster ' + str(k) + ' has no members':^61}")
+            reps.append("")
+            reps_short.append(f"Cluster {k} (empty)")
+            print(f"  cluster {k}: 0 members — WARNING: no representative")
             continue
-        centroid = kmeans.cluster_centers_[k]
-        dists    = np.linalg.norm(endpoint_coords[mask] - centroid, axis=1)
-        rep_idx  = int(mask[np.argmin(dists)])
-        rep_text = completions[rep_idx]
-        representatives.append(rep_text)
-        rep_truncated.append((rep_text[:57] + "…") if len(rep_text) > 60 else rep_text)
-
-        print(f"  cluster {k}: {len(mask)} members  |  representative index: {rep_idx}"
-              f"  |  length: {len(rep_text)} chars")
-        print(f"    text: {repr(rep_text)}")
-        if len(rep_text.strip()) < 10:
-            print(f"  {'!!! WARNING: cluster ' + str(k) + ' has empty/short representative !!!':^61}")
+        centroid = km.cluster_centers_[k]
+        dists    = np.linalg.norm(comp_embs[mask] - centroid, axis=1)
+        rep_i    = int(mask[np.argmin(dists)])
+        rep_text = completions[rep_i]
+        short    = (rep_text[:57] + "…") if len(rep_text) > 60 else rep_text
+        reps.append(rep_text)
+        reps_short.append(short)
+        warn = "  ⚠ WARNING: short/empty" if len(rep_text.strip()) < 10 else ""
+        print(f"  cluster {k}: {len(mask):3d} members  |  "
+              f"rep [{rep_i}] ({len(rep_text)} chars){warn}")
+        print(f"    {repr(rep_text)}")
     print("━" * 65)
     print()
 
-    return labels, representatives, rep_truncated
+    return labels, reps, reps_short
 
 
 # ===========================================================================
-# 8. PLOTLY INTERACTIVE FIGURE
+# 7. KDE + ISOSURFACE
 # ===========================================================================
 
-def _smooth_trajectory(pts: np.ndarray, n_out: int = 120) -> np.ndarray:
-    """Cubic B-spline through *pts* (shape N×3), returns (n_out, 3)."""
-    n = len(pts)
-    if n < 4:
-        return pts
-    t = np.linspace(0, 1, n)
-    t_fine = np.linspace(0, 1, n_out)
-    try:
-        spl = make_interp_spline(t, pts, k=3)
-        return spl(t_fine)
-    except Exception:
-        return pts
+def compute_kde_isosurface(endpoints_3d: np.ndarray) -> dict:
+    """
+    Fit a Gaussian KDE to the 3-D endpoint cloud, evaluate on a regular
+    grid, and extract the MASS_THRESHOLD isosurface via marching cubes.
 
+    Returns a dict with keys:
+        verts_world  – (V, 3) isosurface vertices in world coordinates
+        faces        – (F, 3) triangle face indices
+        density_grid – (R, R, R) KDE values on the grid
+        threshold    – density level at the isosurface
+        spacing      – (dx, dy, dz) voxel dimensions
+        lo           – (3,) world-space grid origin
+    """
+    print(f"[stage 5] Fitting Gaussian KDE (bw_method={KDE_BANDWIDTH!r}) …")
+    kde = gaussian_kde(endpoints_3d.T, bw_method=KDE_BANDWIDTH)
+
+    lo = endpoints_3d.min(axis=0)
+    hi = endpoints_3d.max(axis=0)
+    margin = (hi - lo) * MARGIN_FRAC
+    lo -= margin
+    hi += margin
+
+    print(f"[stage 5] Evaluating KDE on {KDE_GRID_RES}³ grid …")
+    axes   = [np.linspace(lo[d], hi[d], KDE_GRID_RES) for d in range(3)]
+    xi, yi, zi = np.meshgrid(*axes, indexing="ij")
+    grid_pts   = np.vstack([xi.ravel(), yi.ravel(), zi.ravel()])
+    density    = kde(grid_pts).reshape(KDE_GRID_RES, KDE_GRID_RES, KDE_GRID_RES)
+
+    # Density threshold that encloses MASS_THRESHOLD of total probability mass
+    flat_desc = np.sort(density.ravel())[::-1]
+    cumsum    = np.cumsum(flat_desc) / flat_desc.sum()
+    idx       = int(np.searchsorted(cumsum, MASS_THRESHOLD))
+    threshold = float(flat_desc[min(idx, len(flat_desc) - 1)])
+    print(f"          {MASS_THRESHOLD*100:.0f}% mass threshold: {threshold:.4e}")
+
+    spacing = tuple((hi[d] - lo[d]) / (KDE_GRID_RES - 1) for d in range(3))
+
+    print("[stage 5] Extracting isosurface with marching cubes …")
+    verts, faces, _normals, _ = marching_cubes(
+        density, level=threshold, spacing=spacing
+    )
+    # marching_cubes with spacing returns verts in [0, span] space; shift to world
+    verts_world = verts + lo
+
+    print(f"          Isosurface: {len(verts_world):,} vertices, {len(faces):,} faces.")
+    return dict(
+        verts_world  = verts_world,
+        faces        = faces,
+        density_grid = density,
+        threshold    = threshold,
+        spacing      = spacing,
+        lo           = lo,
+    )
+
+
+# ===========================================================================
+# 8. DIAGNOSTICS
+# ===========================================================================
+
+def print_diagnostics(endpoints_3d: np.ndarray, iso: dict) -> None:
+    print()
+    print("━" * 65)
+    print(" MANIFOLD DIAGNOSTICS")
+    print("━" * 65)
+
+    lo_pts = endpoints_3d.min(axis=0)
+    hi_pts = endpoints_3d.max(axis=0)
+    print("  Endpoint cloud bounding box (3-D MDS coordinates):")
+    for axis, label in enumerate("xyz"):
+        span = hi_pts[axis] - lo_pts[axis]
+        print(f"    {label}: [{lo_pts[axis]:.4f}, {hi_pts[axis]:.4f}]"
+              f"  span = {span:.4f}")
+
+    dx, dy, dz  = iso["spacing"]
+    cell_vol    = dx * dy * dz
+    binary      = iso["density_grid"] >= iso["threshold"]
+    volume      = float(np.sum(binary)) * cell_vol
+    area        = mesh_surface_area(iso["verts_world"], iso["faces"])
+    n_comp      = int(sk_label(binary).max())
+
+    print(f"\n  Isosurface (encloses {MASS_THRESHOLD*100:.0f}% of KDE mass):")
+    print(f"    Volume         : {volume:.6f}  (MDS units)³")
+    print(f"    Surface area   : {area:.6f}  (MDS units)²")
+    print(f"    Connected lobes: {n_comp}")
+    if n_comp == 1:
+        print("    → Single connected blob — one coherent semantic neighbourhood.")
+    else:
+        print(f"    → {n_comp} disconnected lobes — the prompt licenses "
+              f"{n_comp} distinct semantic regions.")
+
+    print("━" * 65)
+    print()
+
+
+# ===========================================================================
+# 9. PLOTLY INTERACTIVE FIGURE
+# ===========================================================================
 
 def build_plotly_figure(
-    coords: np.ndarray,
-    comp_ids: list[int],
-    snap_indices: list[int],
-    completions: list[str],
-    labels: np.ndarray,
-    rep_truncated: list[str],
+    endpoints_3d: np.ndarray,
+    prompt_3d:    np.ndarray,
+    completions:  list[str],
+    labels:       np.ndarray,
+    reps_short:   list[str],
+    iso:          dict,
 ) -> go.Figure:
-    print("[stage 6] Building interactive Plotly figure …")
+    print("[stage 6] Building Plotly figure …")
 
-    # Map flat index → coords
-    # Gather per-completion trajectory points
-    traj_pts:  list[list[np.ndarray]] = [[] for _ in range(N_COMPLETIONS)]
-    endpoint_flat_idx: list[int] = [-1] * N_COMPLETIONS
-    origin_flat_idx = -1
+    verts = iso["verts_world"]
+    faces = iso["faces"]
+    fig   = go.Figure()
 
-    for flat_i, (c_idx, s_idx) in enumerate(zip(comp_ids, snap_indices)):
-        if c_idx == -1:
-            origin_flat_idx = flat_i
-        else:
-            traj_pts[c_idx].append((s_idx, coords[flat_i]))
-            if s_idx == N_SNAPSHOTS:
-                endpoint_flat_idx[c_idx] = flat_i
-
-    # Sort each trajectory by snapshot index
-    for c_idx in range(N_COMPLETIONS):
-        traj_pts[c_idx].sort(key=lambda x: x[0])
-
-    origin = coords[origin_flat_idx]
-
-    fig = go.Figure()
-
-    legend_shown = set()
-
-    for c_idx in range(N_COMPLETIONS):
-        k = int(labels[c_idx])
-        color = CLUSTER_COLORS[k % len(CLUSTER_COLORS)]
-        show_legend = k not in legend_shown
-        legend_shown.add(k)
-
-        # Build array: origin + trajectory points
-        pts_raw = np.vstack(
-            [origin] + [p for _, p in traj_pts[c_idx]]
-        )
-        pts_smooth = _smooth_trajectory(pts_raw)
-
-        fig.add_trace(go.Scatter3d(
-            x=pts_smooth[:, 0],
-            y=pts_smooth[:, 1],
-            z=pts_smooth[:, 2],
-            mode="lines",
-            line=dict(color=color, width=2),
-            opacity=0.55,
-            name=f"Cluster {k}: {rep_truncated[k]}" if rep_truncated[k] else f"Cluster {k}",
-            legendgroup=f"cluster_{k}",
-            showlegend=show_legend,
-            hoverinfo="skip",
-        ))
-
-    # Endpoint markers
-    for c_idx in range(N_COMPLETIONS):
-        k = int(labels[c_idx])
-        color = CLUSTER_COLORS[k % len(CLUSTER_COLORS)]
-        ep = coords[endpoint_flat_idx[c_idx]]
-        hover = completions[c_idx][:300]  # truncate for tooltip
-
-        fig.add_trace(go.Scatter3d(
-            x=[ep[0]], y=[ep[1]], z=[ep[2]],
-            mode="markers",
-            marker=dict(size=5, color=color, line=dict(color="white", width=0.5)),
-            legendgroup=f"cluster_{k}",
-            showlegend=False,
-            hovertext=hover,
-            hoverinfo="text",
-            name=f"Cluster {k}",
-        ))
-
-    # Prompt origin marker
-    fig.add_trace(go.Scatter3d(
-        x=[origin[0]], y=[origin[1]], z=[origin[2]],
-        mode="markers",
-        marker=dict(
-            size=12,
-            symbol="diamond",
-            color="black",
-            line=dict(color="gold", width=3),
-        ),
-        name="Prompt origin",
-        hovertext=PROMPT,
-        hoverinfo="text",
+    # Translucent isosurface envelope
+    fig.add_trace(go.Mesh3d(
+        x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+        i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+        opacity    = 0.25,
+        color      = "lightgray",
+        flatshading= False,
+        lighting   = dict(diffuse=0.9, specular=0.2, roughness=0.5, fresnel=0.2),
+        lightposition = dict(x=100, y=200, z=150),
+        name       = f"Envelope ({int(MASS_THRESHOLD*100)}% mass)",
+        showlegend = True,
+        hoverinfo  = "skip",
     ))
 
+    # One scatter trace per cluster (cleaner than one trace per point)
+    for k in range(N_CLUSTERS):
+        mask  = np.where(labels == k)[0]
+        if len(mask) == 0:
+            continue
+        color = CLUSTER_COLORS[k % len(CLUSTER_COLORS)]
+        pts   = endpoints_3d[mask]
+        hover = [completions[i] for i in mask]
+        label = f"Cluster {k}: {reps_short[k]}" if reps_short[k] else f"Cluster {k}"
+
+        fig.add_trace(go.Scatter3d(
+            x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
+            mode       = "markers",
+            marker     = dict(size=5, color=color,
+                              line=dict(color="white", width=0.4)),
+            name       = label,
+            legendgroup= f"cluster_{k}",
+            showlegend = True,
+            hovertext  = hover,
+            hoverinfo  = "text",
+        ))
+
+    # Prompt origin — large black diamond with gold outline
+    fig.add_trace(go.Scatter3d(
+        x=[prompt_3d[0]], y=[prompt_3d[1]], z=[prompt_3d[2]],
+        mode    = "markers",
+        marker  = dict(size=14, symbol="diamond", color="black",
+                       line=dict(color="gold", width=3)),
+        name    = "Prompt origin",
+        hovertext = PROMPT,
+        hoverinfo = "text",
+    ))
+
+    subtitle2 = (
+        f"{N_COMPLETIONS} completions, embedded by {EMBED_MODEL}, "
+        f"projected to 3D (MDS), "
+        f"envelope = {int(MASS_THRESHOLD*100)}% mass isosurface"
+    )
     fig.update_layout(
-        title=dict(text=f'LLM Response Manifold — “{PROMPT}”', font=dict(size=15)),
+        title=dict(
+            text=(
+                "Manifold of meaning licensed by one prompt<br>"
+                f"<sup>{PROMPT}</sup><br>"
+                f"<sup><i>{subtitle2}</i></sup>"
+            ),
+            font=dict(size=14),
+        ),
         scene=dict(
             xaxis_title="MDS-1",
             yaxis_title="MDS-2",
@@ -527,89 +552,90 @@ def build_plotly_figure(
             font=dict(size=10),
             itemsizing="constant",
         ),
-        margin=dict(l=0, r=0, b=0, t=50),
+        margin=dict(l=0, r=0, b=0, t=100),
     )
     return fig
 
 
 # ===========================================================================
-# 9. STATIC MATPLOTLIB 4-VIEW PNG
+# 10. STATIC MATPLOTLIB 4-VIEW PNG
 # ===========================================================================
 
 def build_static_figure(
-    coords: np.ndarray,
-    comp_ids: list[int],
-    snap_indices: list[int],
-    completions: list[str],
-    labels: np.ndarray,
-    rep_truncated: list[str],
+    endpoints_3d: np.ndarray,
+    prompt_3d:    np.ndarray,
+    labels:       np.ndarray,
+    reps_short:   list[str],
+    iso:          dict,
 ) -> None:
     print("[stage 7] Building static 4-view PNG …")
 
-    # Rebuild per-completion arrays (same logic as Plotly section)
-    traj_pts:  list[list[tuple[int, np.ndarray]]] = [[] for _ in range(N_COMPLETIONS)]
-    endpoint_coords: list[np.ndarray] = [None] * N_COMPLETIONS
-    origin = None
+    verts = iso["verts_world"]
+    faces = iso["faces"]
 
-    for flat_i, (c_idx, s_idx) in enumerate(zip(comp_ids, snap_indices)):
-        if c_idx == -1:
-            origin = coords[flat_i]
-        else:
-            traj_pts[c_idx].append((s_idx, coords[flat_i]))
-            if s_idx == N_SNAPSHOTS:
-                endpoint_coords[c_idx] = coords[flat_i]
-
-    for c_idx in range(N_COMPLETIONS):
-        traj_pts[c_idx].sort(key=lambda x: x[0])
+    # Subsample faces so Poly3DCollection stays tractable
+    faces_ds  = faces[::STATIC_MESH_DOWNSAMPLE]
+    tri_verts = verts[faces_ds]          # (M, 3, 3) — each row is one triangle
 
     view_angles = [
         (25,  45,  "Front-left"),
         (25, 135,  "Front-right"),
-        (60,  45,  "Top-left"),
+        (60,  45,  "Top"),
         (10,  10,  "Side"),
     ]
 
+    # Axis limits from the point cloud (Poly3DCollection doesn't auto-expand)
+    all_pts = np.vstack([endpoints_3d, prompt_3d.reshape(1, -1)])
+    pad     = (all_pts.max(axis=0) - all_pts.min(axis=0)).max() * 0.08
+    xlim = (all_pts[:, 0].min() - pad, all_pts[:, 0].max() + pad)
+    ylim = (all_pts[:, 1].min() - pad, all_pts[:, 1].max() + pad)
+    zlim = (all_pts[:, 2].min() - pad, all_pts[:, 2].max() + pad)
+
     fig = plt.figure(figsize=(14, 11))
-    axes = []
-    for i in range(4):
-        ax = fig.add_subplot(2, 2, i + 1, projection="3d")
-        axes.append(ax)
+    legend_handles: list = []
+    legend_labels:  list[str] = []
 
-    legend_handles = []
-    legend_labels  = []
-
-    for ax_i, (ax, (elev, azim, view_name)) in enumerate(zip(axes, view_angles)):
+    for ax_i, (elev, azim, view_name) in enumerate(view_angles):
+        ax = fig.add_subplot(2, 2, ax_i + 1, projection="3d")
         ax.set_title(view_name, fontsize=9, pad=4)
         ax.set_xlabel("MDS-1", fontsize=7, labelpad=2)
         ax.set_ylabel("MDS-2", fontsize=7, labelpad=2)
         ax.set_zlabel("MDS-3", fontsize=7, labelpad=2)
         ax.tick_params(labelsize=6)
         ax.view_init(elev=elev, azim=azim)
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        ax.set_zlim(*zlim)
 
-        legend_added = set()
-        for c_idx in range(N_COMPLETIONS):
-            k = int(labels[c_idx])
+        # Isosurface mesh
+        poly = Poly3DCollection(
+            tri_verts, alpha=0.12,
+            facecolor="lightgray", edgecolor="none",
+        )
+        ax.add_collection3d(poly)
+
+        # Cluster scatter points
+        legend_added: set = set()
+        for k in range(N_CLUSTERS):
+            mask  = np.where(labels == k)[0]
+            if len(mask) == 0:
+                continue
             color = CLUSTER_COLORS[k % len(CLUSTER_COLORS)]
-            pts_raw = np.vstack([origin] + [p for _, p in traj_pts[c_idx]])
-            pts_s   = _smooth_trajectory(pts_raw, n_out=80)
-
-            line, = ax.plot(
-                pts_s[:, 0], pts_s[:, 1], pts_s[:, 2],
-                color=color, alpha=0.45, linewidth=0.8,
+            pts   = endpoints_3d[mask]
+            sc = ax.scatter(
+                pts[:, 0], pts[:, 1], pts[:, 2],
+                color=color, s=14, zorder=5,
+                edgecolors="white", linewidths=0.3,
             )
             if ax_i == 0 and k not in legend_added:
-                legend_handles.append(line)
-                legend_labels.append(f"C{k}: {rep_truncated[k][:45]}")
+                legend_handles.append(sc)
+                legend_labels.append(f"C{k}: {reps_short[k][:40]}")
                 legend_added.add(k)
-
-            ep = endpoint_coords[c_idx]
-            if ep is not None:
-                ax.scatter(*ep, color=color, s=12, zorder=5, edgecolors="white", linewidths=0.3)
 
         # Prompt origin star
         star = ax.scatter(
-            *origin, color="black", s=120, marker="*", zorder=10,
-            edgecolors="gold", linewidths=0.8, label="Prompt origin",
+            *prompt_3d, color="black", s=150, marker="*", zorder=10,
+            edgecolors="gold", linewidths=0.9,
         )
         if ax_i == 0:
             legend_handles.append(star)
@@ -617,17 +643,15 @@ def build_static_figure(
 
     fig.legend(
         legend_handles, legend_labels,
-        loc="lower center",
-        ncol=3,
-        fontsize=7,
-        framealpha=0.85,
+        loc="lower center", ncol=4,
+        fontsize=7, framealpha=0.85,
         bbox_to_anchor=(0.5, 0.01),
     )
     fig.suptitle(
-        f'LLM Response Manifold\n"{PROMPT}"',
-        fontsize=11, y=0.99,
+        f'Manifold of meaning licensed by one prompt\n"{PROMPT}"',
+        fontsize=10, y=0.99,
     )
-    plt.tight_layout(rect=[0, 0.10, 1, 0.97])
+    plt.tight_layout(rect=[0, 0.09, 1, 0.97])
     fig.savefig(OUT_PNG, dpi=140, bbox_inches="tight")
     plt.close(fig)
     print(f"          Saved {OUT_PNG}")
@@ -639,60 +663,29 @@ def build_static_figure(
 
 def main() -> None:
     print("=" * 65)
-    print(" LLM RESPONSE-TRAJECTORY MANIFOLD VISUALISER")
+    print(" LLM RESPONSE MANIFOLD VISUALISER  (envelope edition)")
     print("=" * 65)
-    print(f" Prompt      : {PROMPT}")
-    print(f" Model       : {GEN_MODEL}  |  Embed: {EMBED_MODEL}")
-    print(f" Completions : {N_COMPLETIONS}  |  Snapshots/completion: {N_SNAPSHOTS}")
+    print(f" Prompt          : {PROMPT}")
+    print(f" Model           : {GEN_MODEL}  |  Embed: {EMBED_MODEL}")
+    print(f" Completions     : {N_COMPLETIONS}  |  Clusters: {N_CLUSTERS}")
+    print(f" KDE bandwidth   : {KDE_BANDWIDTH}  |  Mass threshold: {MASS_THRESHOLD}")
+    print(f" Grid resolution : {KDE_GRID_RES}³")
     print("=" * 65)
 
-    # Stage 1 — completions
-    completions = load_or_generate_completions()
+    completions               = load_or_generate_completions()
+    prompt_emb, comp_embs     = load_or_embed_endpoints(completions)
+    prompt_3d,  endpoints_3d  = project_to_3d(prompt_emb, comp_embs)
+    labels, reps, reps_short  = cluster_in_highdim(comp_embs, completions)
+    iso                       = compute_kde_isosurface(endpoints_3d)
+    print_diagnostics(endpoints_3d, iso)
 
-    # ── Diagnostic 1: completions content ────────────────────────────────────
-    print()
-    print("━" * 65)
-    print(" DIAGNOSTIC 1 — COMPLETIONS CACHE")
-    print("━" * 65)
-    non_empty = [c for c in completions if c and c.strip()]
-    lengths_chars = [len(c) for c in completions]
-    lengths_words = [len(c.split()) for c in completions]
-    print(f"  Total completions      : {len(completions)}")
-    print(f"  Non-empty (stripped)   : {len(non_empty)}")
-    print(f"  Avg length (chars)     : {sum(lengths_chars)/len(lengths_chars):.1f}")
-    print(f"  Avg length (words)     : {sum(lengths_words)/len(lengths_words):.1f}")
-    print()
-    print("  First 5 completions:")
-    for i, c in enumerate(completions[:5]):
-        print(f"  [{i}] ({len(c)} chars) {repr(c)}")
-    print("━" * 65)
-    print()
-
-    # Stage 2 — snapshots
-    texts, comp_ids, snap_indices = build_snapshots(completions)
-
-    # Stage 3 — embeddings
-    embeddings = load_or_embed(texts)
-
-    # Stage 4 — MDS
-    coords = project_to_3d(embeddings, comp_ids, snap_indices)
-
-    # Stage 5 — clustering
-    labels, representatives, rep_truncated = cluster_endpoints(
-        coords, comp_ids, snap_indices, completions
-    )
-
-    # Stage 6 — Plotly
     fig = build_plotly_figure(
-        coords, comp_ids, snap_indices, completions, labels, rep_truncated
+        endpoints_3d, prompt_3d, completions, labels, reps_short, iso
     )
     fig.write_html(OUT_HTML, include_plotlyjs=True)
     print(f"[stage 6] Saved interactive figure → {OUT_HTML}")
 
-    # Stage 7 — Matplotlib static
-    build_static_figure(
-        coords, comp_ids, snap_indices, completions, labels, rep_truncated
-    )
+    build_static_figure(endpoints_3d, prompt_3d, labels, reps_short, iso)
     print(f"[stage 7] Saved static figure       → {OUT_PNG}")
 
     print()
